@@ -19,6 +19,11 @@ endif
 build:
 	$(PACKAGE_ROOT)/hack/build.sh build
 
+.PHONY: build-mcp
+build-mcp:
+	@mkdir -p $(PACKAGE_ROOT)/bin
+	CGO_ENABLED=1 go build -mod=vendor -ldflags "$(LDFLAGS)" -o $(PACKAGE_ROOT)/bin/musicfox-mcp $(PACKAGE_ROOT)/cmd/mcp-server
+
 .PHONY: build-macapp
 build-macapp:
 	@mkdir -p $(PACKAGE_ROOT)/bin
