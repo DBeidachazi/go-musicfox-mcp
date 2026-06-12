@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/buger/jsonparser"
 	"github.com/go-musicfox/netease-music/service"
 	musicutil "github.com/go-musicfox/netease-music/util"
 	cookiejar "github.com/juju/persistent-cookiejar"
@@ -27,15 +28,16 @@ import (
 type Service struct {
 	trackManager *track.Manager
 	cookiePath   string
+	curUserID    int64
+	curNickname  string
 }
 
 // NewService 创建一个新的 MCP Service。
-// 它会加载配置、初始化 cookie 认证、创建 track manager。
+// 它会加载配置、初始化 cookie 认证、创建 track manager、获取当前登录用户信息。
 func NewService() (*Service, error) {
 	// 加载配置
 	configPath := app.ConfigFilePath()
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		// 配置文件不存在时使用默认配置
 		slog.Warn("配置文件不存在，使用默认配置", "path", configPath)
 	}
 
@@ -66,10 +68,50 @@ func NewService() (*Service, error) {
 		track.WithCacheLimit(int64(cfg.Storage.Cache.Limit)),
 	)
 
-	return &Service{
+	svc := &Service{
 		trackManager: mgr,
 		cookiePath:   cookiePath,
-	}, nil
+	}
+
+	// 获取当前登录用户信息
+	if userID, nickname, err := fetchCurrentUser(); err != nil {
+		slog.Warn("获取当前用户信息失败（可能未登录）", "error", err)
+	} else {
+		svc.curUserID = userID
+		svc.curNickname = nickname
+		slog.Info("当前用户", "user_id", userID, "nickname", nickname)
+	}
+
+	return svc, nil
+}
+
+// fetchCurrentUser 通过 UserAccountService 获取当前登录用户的 ID 和昵称。
+func fetchCurrentUser() (int64, string, error) {
+	svc := service.UserAccountService{}
+	code, body := svc.AccountInfo()
+	if code != 200 {
+		return 0, "", fmt.Errorf("API 返回错误码: %v", code)
+	}
+
+	// 解析 profile.account.id 和 profile.nickname
+	profile, _, _, err := jsonparser.Get(body, "profile")
+	if err != nil || profile == nil {
+		return 0, "", fmt.Errorf("响应中没有 profile")
+	}
+
+	var accountID float64
+	var nickname string
+
+	if account, _, _, err := jsonparser.Get(body, "account"); err == nil {
+		accountID, _ = jsonparser.GetFloat(account, "id")
+	}
+	nickname, _ = jsonparser.GetString(profile, "nickname")
+
+	if accountID == 0 {
+		return 0, "", fmt.Errorf("未获取到用户 ID")
+	}
+
+	return int64(accountID), nickname, nil
 }
 
 // initCookie 从文件加载 cookie 并设置到全局 cookie jar。
@@ -78,7 +120,6 @@ func initCookie(cookiePath string) error {
 	if err != nil {
 		return fmt.Errorf("创建 cookie jar 失败: %w", err)
 	}
-	// persistent-cookiejar 在 New 时自动从文件加载 cookie
 	musicutil.SetGlobalCookieJar(jar)
 	return nil
 }
@@ -134,19 +175,24 @@ type SongInfo struct {
 
 // PlaylistInfo 用于 MCP 输出的歌单信息
 type PlaylistInfo struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	Creator    string `json:"creator"`
-	TrackCount int    `json:"track_count,omitempty"`
-	URL        string `json:"url"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Creator     string `json:"creator,omitempty"`
+	TrackCount  int    `json:"track_count,omitempty"`
+	Description string `json:"description,omitempty"`
+	CoverURL    string `json:"cover_url,omitempty"`
+	URL         string `json:"url"`
 }
 
 // AlbumInfo 用于 MCP 输出的专辑信息
 type AlbumInfo struct {
-	ID      int64    `json:"id"`
-	Name    string   `json:"name"`
-	Artists []string `json:"artists"`
-	URL     string   `json:"url"`
+	ID        int64    `json:"id"`
+	Name      string   `json:"name"`
+	Artists   []string `json:"artists"`
+	PicURL    string   `json:"pic_url,omitempty"`
+	Desc      string   `json:"description,omitempty"`
+	PublishTime string `json:"publish_time,omitempty"`
+	URL       string   `json:"url"`
 }
 
 // ArtistInfo 用于 MCP 输出的歌手信息
@@ -160,7 +206,7 @@ type ArtistInfo struct {
 // LyricResult 歌词结果
 type LyricResult struct {
 	SongID     int64  `json:"song_id"`
-	SongName   string `json:"song_name"`
+	SongName   string `json:"song_name,omitempty"`
 	Original   string `json:"original"`
 	Translated string `json:"translated,omitempty"`
 	Yrc        string `json:"yrc,omitempty"`
@@ -168,22 +214,22 @@ type LyricResult struct {
 
 // SearchResult 搜索结果
 type SearchResult struct {
-	Type    string         `json:"type"`
-	Songs   []SongInfo     `json:"songs,omitempty"`
-	Albums  []AlbumInfo    `json:"albums,omitempty"`
-	Artists []ArtistInfo   `json:"artists,omitempty"`
+	Type      string         `json:"type"`
+	Songs     []SongInfo     `json:"songs,omitempty"`
+	Albums    []AlbumInfo    `json:"albums,omitempty"`
+	Artists   []ArtistInfo   `json:"artists,omitempty"`
 	Playlists []PlaylistInfo `json:"playlists,omitempty"`
-	Total   int            `json:"total"`
+	Total     int            `json:"total"`
 }
 
 // SongURLResult 歌曲 URL 结果
 type SongURLResult struct {
-	SongID    int64  `json:"song_id"`
-	URL       string `json:"url"`
-	Type      string `json:"type"`
-	Bitrate   int    `json:"bitrate"`
-	Size      int64  `json:"size"`
-	Quality   string `json:"quality"`
+	SongID  int64  `json:"song_id"`
+	URL     string `json:"url"`
+	Type    string `json:"type"`
+	Bitrate int    `json:"bitrate"`
+	Size    int64  `json:"size"`
+	Quality string `json:"quality"`
 }
 
 // DownloadResult 下载结果
@@ -203,18 +249,64 @@ type PlayResult struct {
 
 // PlayingInfo 当前播放信息
 type PlayingInfo struct {
-	SongID    int64    `json:"song_id"`
-	SongName  string   `json:"song_name"`
-	Artists   []string `json:"artists"`
-	Album     string   `json:"album"`
-	Position  string   `json:"position"`
-	Duration  string   `json:"duration"`
-	State     string   `json:"state"`
-	Volume    int      `json:"volume"`
-	PlayMode  string   `json:"play_mode"`
+	SongID   int64    `json:"song_id"`
+	SongName string   `json:"song_name"`
+	Artists  []string `json:"artists"`
+	Album    string   `json:"album"`
+	Position string   `json:"position"`
+	Duration string   `json:"duration"`
+	State    string   `json:"state"`
+	Volume   int      `json:"volume"`
+	PlayMode string   `json:"play_mode"`
+}
+
+// CurrentUserInfo 当前登录用户信息
+type CurrentUserInfo struct {
+	UserID   int64  `json:"user_id"`
+	Nickname string `json:"nickname"`
+}
+
+// SongDetailResult 歌曲详情结果
+type SongDetailResult struct {
+	ID          int64    `json:"id"`
+	Name        string   `json:"name"`
+	Artists     []string `json:"artists"`
+	Album       string   `json:"album"`
+	AlbumID     int64    `json:"album_id"`
+	CoverURL    string   `json:"cover_url,omitempty"`
+	Duration    string   `json:"duration"`
+	Popularity  float64  `json:"popularity,omitempty"`
+	URL         string   `json:"url"`
+}
+
+// PlaylistDetailResult 歌单详情结果
+type PlaylistDetailResult struct {
+	ID          int64      `json:"id"`
+	Name        string     `json:"name"`
+	Creator     string     `json:"creator"`
+	Description string     `json:"description,omitempty"`
+	CoverURL    string     `json:"cover_url,omitempty"`
+	Tags        []string   `json:"tags,omitempty"`
+	TrackCount  int        `json:"track_count"`
+	PlayCount   int64      `json:"play_count,omitempty"`
+	Songs       []SongInfo `json:"songs,omitempty"`
+	URL         string     `json:"url"`
+}
+
+// SearchSuggestResult 搜索建议结果
+type SearchSuggestResult struct {
+	Keywords []string `json:"keywords"`
 }
 
 // ---------- Tier 1: 纯 API 查询 ----------
+
+// GetCurrentUserInfo 返回当前登录用户信息
+func (s *Service) GetCurrentUserInfo() *CurrentUserInfo {
+	return &CurrentUserInfo{
+		UserID:   s.curUserID,
+		Nickname: s.curNickname,
+	}
+}
 
 // Search 搜索网易云音乐
 func (s *Service) Search(ctx context.Context, keywords string, searchType SearchType, limit, offset int) (*SearchResult, error) {
@@ -255,9 +347,52 @@ func (s *Service) Search(ctx context.Context, keywords string, searchType Search
 		playlists := _struct.GetPlaylistsOfSearchResult(response)
 		result.Playlists = convertPlaylists(playlists)
 		result.Total = len(playlists)
+	case SearchLyrics:
+		// 歌词搜索结果也是歌曲列表
+		songs := _struct.GetSongsOfSearchResult(response)
+		result.Songs = convertSongs(songs)
+		result.Total = len(songs)
+	case SearchDjRadio:
+		djRadios := _struct.GetDjRadiosOfSearchResult(response)
+		// 转换为通用的播放列表格式
+		playlists := make([]PlaylistInfo, 0, len(djRadios))
+		for _, d := range djRadios {
+			playlists = append(playlists, PlaylistInfo{
+				ID:   d.Id,
+				Name: d.Name,
+				URL:  neteaseutil.WebUrlOfPlaylist(d.Id),
+			})
+		}
+		result.Playlists = playlists
+		result.Total = len(djRadios)
 	}
 
 	return result, nil
+}
+
+// SearchSuggest 搜索建议
+func (s *Service) SearchSuggest(ctx context.Context, keywords string) (*SearchSuggestResult, error) {
+	svc := service.SearchSuggestService{S: keywords}
+	code, response := svc.SearchSuggest()
+	if code != 200 {
+		return nil, fmt.Errorf("获取搜索建议失败")
+	}
+
+	// 解析 keywords 数组
+	allMatch, _, _, _ := jsonparser.Get(response, "result", "allMatch")
+	if allMatch == nil {
+		return &SearchSuggestResult{Keywords: []string{}}, nil
+	}
+
+	var keywords_list []string
+	jsonparser.ArrayEach(allMatch, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+		kw, _ := jsonparser.GetString(value, "keyword")
+		if kw != "" {
+			keywords_list = append(keywords_list, kw)
+		}
+	})
+
+	return &SearchSuggestResult{Keywords: keywords_list}, nil
 }
 
 // GetSongURL 获取歌曲播放 URL
@@ -275,13 +410,60 @@ func (s *Service) GetSongURL(ctx context.Context, songID int64, quality string) 
 		return nil, fmt.Errorf("歌曲 %d 无法获取播放链接（可能需要 VIP 或地区限制）", songID)
 	}
 
+	// 从 quality 推导 bitrate
+	bitrate := 320000
+	if strings.ToLower(quality) == "lossless" || strings.ToLower(quality) == "hires" {
+		bitrate = 999000
+	}
+
 	return &SongURLResult{
 		SongID:  songID,
 		URL:     info.URL,
 		Type:    info.MusicType,
+		Bitrate: bitrate,
 		Size:    info.Size,
 		Quality: quality,
 	}, nil
+}
+
+// GetSongDetail 获取歌曲详情（封面、时长等元信息）
+func (s *Service) GetSongDetail(ctx context.Context, songID int64) (*SongDetailResult, error) {
+	svc := service.SongDetailService{Ids: strconv.FormatInt(songID, 10)}
+	code, response := svc.SongDetail()
+	if code != 200 {
+		return nil, fmt.Errorf("获取歌曲详情失败")
+	}
+
+	// song/detail API 返回 {"songs": [...]}，不是 {"result": {"songs": [...]}}
+	// 使用 GetSongsOfAlbum 来解析（它读取顶层 songs 数组）
+	songs := _struct.GetSongsOfAlbum(response)
+	if len(songs) == 0 {
+		return nil, fmt.Errorf("未找到歌曲 %d", songID)
+	}
+
+	song := songs[0]
+	artists := make([]string, 0, len(song.Artists))
+	for _, a := range song.Artists {
+		artists = append(artists, a.Name)
+	}
+
+	result := &SongDetailResult{
+		ID:       song.Id,
+		Name:     song.Name,
+		Artists:  artists,
+		Album:    song.Album.Name,
+		AlbumID:  song.Album.Id,
+		CoverURL: song.Album.PicUrl,
+		Duration: song.Duration.String(),
+		URL:      neteaseutil.WebUrlOfSong(song.Id),
+	}
+
+	// 尝试获取热度
+	if pop, err := jsonparser.GetFloat(response, "songs", "[0]", "pop"); err == nil {
+		result.Popularity = pop
+	}
+
+	return result, nil
 }
 
 // GetLyrics 获取歌词
@@ -301,24 +483,23 @@ func (s *Service) GetLyrics(ctx context.Context, songID int64) (*LyricResult, er
 
 // DownloadSong 下载歌曲到本地
 func (s *Service) DownloadSong(ctx context.Context, songID int64, quality string, outputDir string) (*DownloadResult, error) {
-	// 先获取歌曲信息
 	song := structs.Song{Id: songID}
 
-	// 如果指定了输出目录，临时覆盖
+	// 使用独立的 track manager 避免污染共享状态
+	mgr := s.trackManager
 	if outputDir != "" {
-		s.trackManager = track.NewManager(
+		mgr = track.NewManager(
 			track.WithSongQuality(parseQuality(quality)),
 			track.WithDownloadDir(outputDir),
 			track.WithCacheLimit(0),
 		)
 	}
 
-	filePath, err := s.trackManager.DownloadSong(ctx, song)
+	filePath, err := mgr.DownloadSong(ctx, song)
 	if err != nil {
 		return nil, fmt.Errorf("下载歌曲失败: %w", err)
 	}
 
-	// 获取文件大小
 	var size int64
 	if fi, err := os.Stat(filePath); err == nil {
 		size = fi.Size()
@@ -333,11 +514,71 @@ func (s *Service) DownloadSong(ctx context.Context, songID int64, quality string
 
 // GetUserPlaylists 获取用户歌单列表
 func (s *Service) GetUserPlaylists(ctx context.Context, userID int64, limit, offset int) ([]PlaylistInfo, error) {
+	// 默认使用当前登录用户
+	if userID == 0 {
+		userID = s.curUserID
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("未登录且未指定 user_id")
+	}
+
 	codeType, playlists, _ := netease.FetchUserPlaylists(userID, limit, offset)
 	if codeType != _struct.Success {
 		return nil, fmt.Errorf("获取歌单失败")
 	}
 	return convertPlaylists(playlists), nil
+}
+
+// GetPlaylistDetail 获取歌单详情（封面、描述、标签、歌曲列表）
+func (s *Service) GetPlaylistDetail(ctx context.Context, playlistID int64, includeSongs bool) (*PlaylistDetailResult, error) {
+	svc := service.PlaylistDetailService{
+		Id: strconv.FormatInt(playlistID, 10),
+		S:  "8",
+	}
+	code, response := svc.PlaylistDetail()
+	if code != 200 {
+		return nil, fmt.Errorf("获取歌单详情失败")
+	}
+
+	result := &PlaylistDetailResult{
+		ID:  playlistID,
+		URL: neteaseutil.WebUrlOfPlaylist(playlistID),
+	}
+
+	// 解析歌单基本信息
+	if name, err := jsonparser.GetString(response, "playlist", "name"); err == nil {
+		result.Name = name
+	}
+	if desc, err := jsonparser.GetString(response, "playlist", "description"); err == nil {
+		result.Description = desc
+	}
+	if coverURL, err := jsonparser.GetString(response, "playlist", "coverImgUrl"); err == nil {
+		result.CoverURL = coverURL
+	}
+	if trackCount, err := jsonparser.GetInt(response, "playlist", "trackCount"); err == nil {
+		result.TrackCount = int(trackCount)
+	}
+	if playCount, err := jsonparser.GetInt(response, "playlist", "playCount"); err == nil {
+		result.PlayCount = playCount
+	}
+	if nickname, err := jsonparser.GetString(response, "playlist", "creator", "nickname"); err == nil {
+		result.Creator = nickname
+	}
+
+	// 解析标签
+	if tags, _, _, err := jsonparser.Get(response, "playlist", "tags"); err == nil && tags != nil {
+		jsonparser.ArrayEach(tags, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+			result.Tags = append(result.Tags, string(value))
+		})
+	}
+
+	// 解析歌曲列表
+	if includeSongs {
+		songs := _struct.GetSongsOfPlaylist(response)
+		result.Songs = convertSongs(songs)
+	}
+
+	return result, nil
 }
 
 // GetPlaylistSongs 获取歌单内的歌曲
@@ -413,17 +654,43 @@ func (s *Service) DailySignin(ctx context.Context) (string, error) {
 }
 
 // GetAlbumDetail 获取专辑详情
-func (s *Service) GetAlbumDetail(ctx context.Context, albumID int64) (interface{}, error) {
+func (s *Service) GetAlbumDetail(ctx context.Context, albumID int64) (*AlbumInfo, error) {
 	albumService := service.AlbumDetailService{ID: strconv.FormatInt(albumID, 10)}
 	code, response := albumService.AlbumDetail()
 	codeType := _struct.CheckCode(code)
 	if codeType != _struct.Success {
 		return nil, fmt.Errorf("获取专辑详情失败")
 	}
-	songs := _struct.GetSongsOfAlbum(response)
-	return map[string]interface{}{
-		"songs": convertSongs(songs),
-	}, nil
+
+	// 解析专辑信息
+	result := &AlbumInfo{
+		ID:  albumID,
+		URL: neteaseutil.WebUrlOfAlbum(albumID),
+	}
+
+	if name, err := jsonparser.GetString(response, "album", "name"); err == nil {
+		result.Name = name
+	}
+	if picURL, err := jsonparser.GetString(response, "album", "picUrl"); err == nil {
+		result.PicURL = picURL
+	}
+	if desc, err := jsonparser.GetString(response, "album", "description"); err == nil {
+		result.Desc = desc
+	}
+	if publishTime, err := jsonparser.GetInt(response, "album", "publishTime"); err == nil && publishTime > 0 {
+		result.PublishTime = fmt.Sprintf("%d", publishTime)
+	}
+
+	// 解析歌手
+	if artistArr, _, _, err := jsonparser.Get(response, "album", "artists"); err == nil {
+		jsonparser.ArrayEach(artistArr, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+			if name, err := jsonparser.GetString(value, "name"); err == nil {
+				result.Artists = append(result.Artists, name)
+			}
+		})
+	}
+
+	return result, nil
 }
 
 // GetArtistSongs 获取歌手的歌曲
@@ -444,11 +711,96 @@ func (s *Service) GetArtistSongs(ctx context.Context, artistID int64, limit, off
 
 // GetUserLikes 获取用户喜欢的歌曲
 func (s *Service) GetUserLikes(ctx context.Context, userID int64) ([]SongInfo, error) {
+	// 默认使用当前登录用户
+	if userID == 0 {
+		userID = s.curUserID
+	}
+	if userID == 0 {
+		return nil, fmt.Errorf("未登录且未指定 user_id")
+	}
+
 	songs, err := netease.FetchLikeSongs(userID, true)
 	if err != nil {
 		return nil, fmt.Errorf("获取喜欢歌曲失败: %w", err)
 	}
 	return convertSongs(songs), nil
+}
+
+// ---------- 歌单管理 ----------
+
+// CreatePlaylist 创建歌单
+func (s *Service) CreatePlaylist(ctx context.Context, name string, privacy bool) (int64, string, error) {
+	svc := service.PlaylistCreateService{Name: name}
+	if privacy {
+		svc.Privacy = "10"
+	}
+	code, response := svc.PlaylistCreate()
+	if code != 200 {
+		return 0, "", fmt.Errorf("创建歌单失败，错误码: %v", code)
+	}
+
+	playlistID, _ := jsonparser.GetInt(response, "id")
+	playlistName, _ := jsonparser.GetString(response, "name")
+	return playlistID, playlistName, nil
+}
+
+// DeletePlaylist 删除歌单
+func (s *Service) DeletePlaylist(ctx context.Context, playlistID int64) error {
+	svc := service.PlaylistDeleteService{ID: strconv.FormatInt(playlistID, 10)}
+	code, _ := svc.PlaylistDelete()
+	if code != 200 {
+		return fmt.Errorf("删除歌单失败，错误码: %v", code)
+	}
+	return nil
+}
+
+// RenamePlaylist 重命名歌单
+func (s *Service) RenamePlaylist(ctx context.Context, playlistID int64, newName string) error {
+	svc := service.PlaylistNameUpdateService{
+		Id:   strconv.FormatInt(playlistID, 10),
+		Name: newName,
+	}
+	code, _ := svc.PlaylistNameUpdate()
+	if code != 200 {
+		return fmt.Errorf("重命名歌单失败，错误码: %v", code)
+	}
+	return nil
+}
+
+// AddToPlaylist 向歌单添加歌曲
+func (s *Service) AddToPlaylist(ctx context.Context, playlistID int64, songIDs []int64) error {
+	strIDs := make([]string, 0, len(songIDs))
+	for _, id := range songIDs {
+		strIDs = append(strIDs, strconv.FormatInt(id, 10))
+	}
+
+	svc := service.PlaylistTrackAddService{
+		Id:      strconv.FormatInt(playlistID, 10),
+		SongIds: strIDs,
+	}
+	code, _ := svc.AddTracks()
+	if code != 200 {
+		return fmt.Errorf("添加歌曲到歌单失败，错误码: %v", code)
+	}
+	return nil
+}
+
+// RemoveFromPlaylist 从歌单删除歌曲
+func (s *Service) RemoveFromPlaylist(ctx context.Context, playlistID int64, songIDs []int64) error {
+	strIDs := make([]string, 0, len(songIDs))
+	for _, id := range songIDs {
+		strIDs = append(strIDs, strconv.FormatInt(id, 10))
+	}
+
+	svc := service.PlaylistTrackDeleteService{
+		Id:      strconv.FormatInt(playlistID, 10),
+		SongIds: strIDs,
+	}
+	code, _ := svc.DeleteTracks()
+	if code != 200 {
+		return fmt.Errorf("从歌单删除歌曲失败，错误码: %v", code)
+	}
+	return nil
 }
 
 // ---------- 工具函数 ----------
@@ -525,6 +877,3 @@ func convertPlaylists(playlists []structs.Playlist) []PlaylistInfo {
 	}
 	return result
 }
-
-// WebUrlOfSong 等函数在 utils/struct 包中，需要确认是否存在
-// 这里使用 netease 包中的函数
